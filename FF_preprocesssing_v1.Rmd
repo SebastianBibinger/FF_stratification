@@ -1,0 +1,206 @@
+---
+title: "FF_preprocessing"
+author: "Sebastian Bibinger"
+date: "2026-06-01"
+output: html_document
+---
+# Packages
+```{r}
+library(readxl)
+library(tidyverse)
+library(vegan)
+library(phyloseq)
+library(metagMisc)
+library(phangorn)
+```
+
+# Read and prepare data
+## Read in files
+```{r}
+# taxonomy, abundance (DADA2 sequence table), and sample metadata
+taxa <- read.table(file = 'FF_taxonomy.tabular', sep = "\t", header = TRUE)
+
+abundance <- read.table(file = 'FF_abundance.dada2_sequencetable', sep = "\t", header = TRUE)
+
+metadata <- read_excel("FF_metadata.xlsx") %>%
+  filter(existing == "yes")
+
+```
+
+## Rarefaction curves
+```{r, eval = FALSE}
+rarecurve(t(abundance), step = 500) # all samples
+
+abundance_controls <- abundance %>% select(contains("E")) # negative controls only
+rarecurve(t(abundance_controls), step = 25)
+
+rm(abundance_controls)
+```
+
+
+
+```{r}
+# taxa: clean column names
+colnames(taxa) <- c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+
+# abundance: clean column names (strip leading "X" from sample IDs)
+colnames(abundance) <- substring(colnames(abundance), 2)
+
+# metadata: set factors, recode layers, derive ratios and grouping variables
+metadata <- metadata %>%
+  tibble::column_to_rownames("nr") %>%
+  mutate(
+    across(ends_with("_exch"), as.numeric),
+    p_total_citrate = as.numeric(p_total_citrate),
+    replicate       = factor(replicate),
+    layer = case_when(
+      layer == "A (0-5cm)"   ~ "A5",
+      layer == "A (5-10cm)"  ~ "A10",
+      layer == "A (10-20cm)" ~ "A20",
+      TRUE                   ~ str_to_title(layer)
+    ),
+    site  = factor(site,  levels = c("Bad Brückenau", "Mitterfels", "Kandel")),
+    code  = factor(code,  levels = c("BBR", "MIT", "KAN")),
+    layer = factor(layer, levels = c("Ol0", "Ol1", "Olf", "Ohf", "Oh",
+                                     "A5", "A10", "A20")),
+    nr         = row.names(metadata),
+    type       = paste(code, "_", layer),
+    qpit       = interaction(code, replicate),
+    ff_type    = if_else(code == "BBR", "mull", "moder"),
+    superlayer = case_when(
+      layer %in% c("Ol0", "Ol1")     ~ "OL",
+      layer %in% c("Olf", "Ohf")     ~ "OF",
+      layer == "Oh"                  ~ "OH",
+      layer %in% c("A5", "A10", "A20") ~ "A",
+      TRUE                           ~ NA_character_
+    ),
+    CN = TOC / N_tot,
+    CP = TOC / P_tot
+  )
+
+# taxa: shorten long names, fill missing ranks, resolve ambiguous labels
+taxa <- taxa %>%
+  mutate(
+    Genus = if_else(Genus == "Allorhizobium-Neorhizobium-Pararhizobium-Rhizobium",
+                    "Rhizobium", Genus),
+    Order   = if_else(str_starts(Order,   "Subgroup"), paste(Phylum, Order),   Order),
+    Family  = if_else(str_starts(Family,  "Subgroup") & !str_detect(Family,  "Subgroup "), paste(Order,  Family),  Family),
+    Genus   = if_else(str_starts(Genus,   "Subgroup") & !str_detect(Genus,   "Subgroup "), paste(Family, Genus),   Genus),
+    Species = if_else(str_starts(Species, "Subgroup") & !str_detect(Species, "Subgroup "), paste(Genus,  Species), Species),
+    Kingdom = replace_na(Kingdom, "Unknown Kingdom"),
+    Phylum  = replace_na(Phylum,  "unknown Phylum"),
+    Class   = if_else(Phylum == "unknown Phylum", "unknown Phylum", coalesce(Class,  paste(Phylum, "C."))),
+    Order   = if_else(Phylum == "unknown Phylum", "unknown Phylum", coalesce(Order,  paste(Class,  "O."))),
+    Family  = if_else(Phylum == "unknown Phylum", "unknown Phylum", coalesce(Family, paste(Order,  "F."))),
+    Genus   = if_else(Phylum == "unknown Phylum", "unknown Phylum", coalesce(Genus,  paste(Family, "G."))),
+    Species = case_when(
+      Phylum == "unknown Phylum"         ~ "unknown Phylum",
+      !is.na(Species) & !is.na(Genus)   ~ paste(Genus, Species),
+      TRUE                              ~ coalesce(Species, paste(Genus, "Sp."))
+    )
+  )
+```
+
+
+## Decontamination
+```{r}
+# record taxa/read counts before decontamination
+reads_before <- colSums(abundance)
+taxa_before <- nrow(abundance)
+
+# remove contaminants by prevalence (negative controls flagged via "E" columns)
+abundance = abundance[!decontam::isContaminant(t(abundance),
+                                   neg = c(colnames(abundance)
+                                           %in% colnames(abundance %>% dplyr::select(contains("E")))) ,
+                                   method = "prevalence",
+                                   threshold = 0.05,
+                                   normalize = T,
+                                   detailed = F), ]
+
+# counts after decontamination and loss summary
+reads_after <- colSums(abundance)
+taxa_after <- nrow(abundance)
+
+taxa_before - taxa_after
+100 - (taxa_after/taxa_before)*100
+100 - (sum(reads_after)/sum(reads_before))*100
+```
+
+## Removal of negative controls
+```{r}
+abundance <- abundance %>% dplyr::select(!contains("E"))
+```
+
+## Removal of mitochondrial and chloroplast sequences
+```{r}
+# record counts before filtering
+reads_before <- colSums(abundance)
+taxa_before <- nrow(abundance)
+
+# drop chloroplast, mitochondria, eukaryote, and unassigned sequences
+abundance <- abundance %>%
+  filter(rownames(.) %in% rownames(taxa %>%
+                      filter(!Order %in% "Chloroplast" &
+                               !Family %in% "Mitochondria" &
+                               !is.na(Kingdom) &
+                               Kingdom != "Eukaryota")))
+
+# counts after filtering and loss summary
+reads_after <- colSums(abundance)
+taxa_after <- nrow(abundance)
+
+taxa_before - taxa_after
+100 - (taxa_after/taxa_before)*100
+100 - (sum(reads_after)/sum(reads_before))*100
+
+
+rm(reads_before, reads_after, taxa_after, taxa_before)
+```
+
+# Creation of phyloseq object
+```{r}
+# load and midpoint-root the phylogenetic tree
+load("FF_tree.RData")
+tree_rooted <- midpoint(tree)
+
+# assemble phyloseq object from abundance, taxonomy, metadata, and tree
+ps <- phyloseq(otu_table(as.matrix(abundance), taxa_are_rows = TRUE),
+               tax_table(as.matrix(taxa)),
+               sample_data(metadata),
+               tree_rooted)
+
+```
+
+# Subsetting and normalising
+```{r}
+# keep an untouched copy of the full object
+ps_full_raw <- ps
+
+# remove the deepest A horizon (A20)
+ps <- subset_samples(ps, layer != "A20")
+# remove KAN replicate 1 as an outlier
+ps <- subset_samples(ps, !grepl("KAN-1", sample))
+
+# filter out rare taxa
+ps <- prune_taxa(taxa_sums(ps) > 10, ps)
+
+# attach reference sequences, tagged as ASVs
+ps <- microbiome::add_refseq(ps, tag = "ASV")
+
+# CSS normalization (keep a non-normalized copy)
+ps_nonorm <- ps
+ps <- phyloseq_transform_css(ps, norm = T, log = F)
+# round to nearest integer
+ps <- transform_sample_counts(ps, function(x) round(x, 0))
+
+# drop taxa with zero abundance after normalization
+ps <- prune_taxa(apply(otu_table(ps), 1, function(x) sum(x > 0)) >= 1, ps)
+```
+
+
+# Save final phyloseq object
+```{r, eval = F}
+# save(ps, file = "FF_ps.RData")
+# save(ps_nonorm, file = "FF_ps_nonorm.RData")
+# save(ps_full_raw, file = "FF_ps_full_raw.RData")
+```

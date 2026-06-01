@@ -1,0 +1,1631 @@
+---
+title: "Vertical stratification drives additive prokaryotic diversity in beech forest floors, while site conditions shape boundary layers"
+author: "Sebastian Bibinger"
+date: "2026-06-01"
+output: html_document
+---
+# Initiation
+```{r}
+# data wrangling
+library(broom)
+library(forcats)
+library(tidytext)
+library(tidyverse)
+library(dplyr)
+library(tibble)
+library(stringr)
+
+# microbiome & ecology
+library(file2meco)
+library(microbiome)
+library(microeco)
+library(phyloseq)
+library(picante)
+library(vegan)
+library(metagMisc)
+
+# statistical analysis
+library(car)
+library(DESeq2)
+library(dunn.test)
+library(indicspecies)
+library(multcompView)
+library(usdm)
+library(lme4)
+library(lmerTest)
+library(emmeans)
+library(broom.mixed)
+library(rcompanion)
+library(FSA)
+
+# visualization
+library(circlize)
+library(ComplexHeatmap)
+library(cowplot)
+library(ggh4x)
+library(ggokabeito)
+library(ggpattern)
+library(ggpubr)
+library(ggrepel)
+library(ggtext)
+library(ggvenn)
+library(patchwork)
+library(pheatmap)
+library(UpSetR)
+library(viridis)
+
+# I/O
+library(readxl)
+library(writexl)
+
+# loading data
+# phyloseq objects
+load("raw_data/FF_ps.RData")
+load("raw_data/FF_ps_nonorm.RData")
+
+# color palettes
+colors_horizon <- c("#F0E442", "#E69F00", "#CC79A7", "#EE6677",
+                    "#117733", "#56B4E9", "#332288")
+colors_site <- c("#D55E00", "#009E73", "#0072B2")
+
+# Extract  metadata 
+metadata <- sample_data(ps) %>% data.frame()
+```
+
+# Alpha diversity
+## ASV (observed richness, rarefied)
+```{r, eval = F}
+# rarefy to even depth (minimum sample size)
+set.seed(1)
+ps_rare <- rarefy_even_depth(
+  ps_nonorm,
+  sample.size = min(sample_sums(ps_nonorm)),
+  rngseed     = 42,
+  replace     = FALSE,
+  trimOTUs    = TRUE,
+  verbose     = TRUE
+)
+
+# observed richness per sample
+alpha <- data.frame(
+  observed = estimate_richness(ps_rare, measures = "Observed")$Observed,
+  metadata
+)
+
+# mean and SD per site x layer
+means <- alpha %>%
+  group_by(code, layer) %>%
+  summarise(mean = mean(observed),
+            sd   = sd(observed),
+            .groups = "drop") %>%
+  arrange(layer)
+
+# plot richness by layer and site
+ggplot(means, aes(x = layer, y = mean, group = code)) +
+  geom_errorbar(
+    aes(ymin = mean - sd, ymax = mean + sd),
+    position = position_dodge(width = 0.5),
+    width    = 0.25,
+    color    = "black") +
+  geom_point(position = position_dodge(width = 0.5), size = 2.5,
+            aes(color = code)) +
+  scale_color_manual(values = colors_site) +
+  labs(
+    y     = "Observed richness (ASV)",
+    x     = "Layer",
+    color = "Site") +
+  theme_bw(base_size = 8) +
+  theme(
+    axis.title.x    = element_blank(),
+    axis.text.x     = element_text(angle = 45, hjust = 1),
+    legend.title    = element_text(size = 8, face = "bold"),
+    legend.position = "none")
+
+#ggsave("plots/richness_asv.pdf", width = 10, height = 7.5, units = "cm")
+
+# linear mixed model (log-transformed richness)
+model_lmm <- lmer(log(observed) ~ site * layer + (1|qpit), data = alpha)
+anova_summary <- broom.mixed::tidy(anova(model_lmm, type = 3))
+anova_summary
+
+# model assumptions
+shapiro.test(residuals(model_lmm))
+plot(model_lmm)
+qqnorm(residuals(model_lmm))
+qqline(residuals(model_lmm))
+leveneTest(log(observed) ~ site * layer, data = alpha)
+
+# post hoc tests (main effects only)
+emm_layer <- emmeans(model_lmm, specs = pairwise ~ layer)
+emm_site <- emmeans(model_lmm, pairwise ~ site,
+                    at = list(layer = c("Ol0", "Ol1", "Olf", "Ohf", "A5", "A10")))
+
+# extract contrasts
+res_layer <- as.data.frame(emm_layer$contrasts)
+res_site  <- as.data.frame(emm_site$contrasts)
+
+# mean and SD per layer
+means_layer <- alpha %>%
+  group_by(layer) %>%
+  summarise(mean_observed = mean(observed),
+            sd_observed   = sd(observed),
+            .groups = "drop")
+
+# collect results for export
+results_for_excel_asv <- list(
+  "LMM_ANOVA_Summary"         = anova_summary,
+  "PostHoc_Layer_Main"        = res_layer,
+  "PostHoc_Site_within_Layer" = res_site,
+  "Means_Raw_Layer"           = means_layer
+)
+
+#write_xlsx(results_for_excel, path = "stats/alpha_diversity_lmm_asv.xlsx")
+```
+
+## Phylum (observed, rarefied)
+```{r, eval = F}
+# rarefy to even depth (minimum sample size)
+set.seed(1)
+ps_rare <- rarefy_even_depth(
+  ps_nonorm,
+  sample.size = min(sample_sums(ps_nonorm)),
+  rngseed     = 42,
+  replace     = FALSE,
+  trimOTUs    = TRUE,
+  verbose     = TRUE
+)
+
+# agglomerate to phylum level and compute richness
+ps_phylum <- tax_glom(ps_rare, taxrank = "Phylum")
+alpha_phy <- data.frame(
+  "observed" = estimate_richness(ps_phylum, measures = "Observed")$Observed,
+  data.frame(sample_data(ps_phylum)))
+
+# mean and SD per site x layer
+means_phy <- alpha_phy %>%
+  group_by(code, layer) %>%
+  summarise(mean = mean(observed),
+            sd   = sd(observed),
+            .groups = "drop") %>%
+  arrange(layer)
+
+# plot richness by layer and site
+ggplot(means_phy, aes(x = layer, y = mean, group = code)) +
+  geom_errorbar(
+    aes(ymin = mean - sd, ymax = mean + sd),
+    position = position_dodge(width = 0.5),
+    width    = 0.25,
+    color    = "black"
+  ) +
+  geom_point(position = position_dodge(width = 0.5), size = 2.5,
+            aes(color = code)) +
+  scale_color_manual(values = colors_site) +
+  labs(
+    y     = "Observed Richness (Phylum)",
+    x     = "Layer",
+    color = "Site"
+  ) +
+  theme_bw(base_size = 8) +
+  theme(
+    axis.title.x    = element_blank(),
+    axis.text.x     = element_text(angle = 45, hjust = 1),
+    legend.title    = element_text(size = 8, face = "bold"),
+    legend.position = "none"
+  )
+
+#ggsave("plots/richness_phylum.pdf", width = 10, height = 7.5, units = "cm")
+
+# linear mixed model (log-transformed richness)
+model_lmm <- lmer(log(observed) ~ site * layer + (1|qpit), data = alpha_phy)
+anova_summary <- broom.mixed::tidy(anova(model_lmm, type = 3))
+anova_summary
+
+# model assumptions
+shapiro.test(residuals(model_lmm))
+plot(model_lmm)
+qqnorm(residuals(model_lmm))
+qqline(residuals(model_lmm))
+leveneTest(log(observed) ~ site * layer, data = alpha_phy)
+
+# post hoc tests (main effects only)
+emm_layer <- emmeans(model_lmm, specs = pairwise ~ layer)
+emm_site <- emmeans(model_lmm, pairwise ~ site,
+                    at = list(layer = c("Ol0", "Ol1", "Olf", "Ohf", "A5", "A10")))
+
+# extract contrasts
+res_layer <- as.data.frame(emm_layer$contrasts)
+res_site  <- as.data.frame(emm_site$contrasts)
+
+# mean and SD per layer
+means_layer <- alpha_phy %>%
+  group_by(layer) %>%
+  summarise(mean_observed = mean(observed),
+            sd_observed   = sd(observed),
+            .groups = "drop")
+
+# collect results for export
+results_for_excel_phylum <- list(
+  "LMM_ANOVA_Summary"         = anova_summary,
+  "PostHoc_Layer_Main"        = res_layer,
+  "PostHoc_Site_within_Layer" = res_site,
+  "Means_Raw_Layer"           = means_layer
+)
+
+#write_xlsx(results_for_excel, path = "stats/alpha_diversity_lmm_phylum.xlsx")
+```
+
+## data export
+```{r, eval = F}
+# combine ANOVA tables
+anova_combined <- bind_rows(
+  results_for_excel_asv$LMM_ANOVA_Summary %>% mutate(Index = "ASV richness"),
+  results_for_excel_phylum$LMM_ANOVA_Summary %>% mutate(Index = "Phylum richness")
+) %>%
+  select(Index, Effect = term, SumSq = sumsq, MeanSq = meansq,
+         NumDF, DenDF, F_value = statistic, p_value = p.value) %>%
+  mutate(p_value = ifelse(p_value < 0.0001, "<0.0001",
+                          formatC(p_value, format = "f", digits = 4)))
+
+# combine layer post-hoc tables
+posthoc_layer_combined <- bind_rows(
+  results_for_excel_asv$PostHoc_Layer_Main %>% mutate(Index = "ASV richness"),
+  results_for_excel_phylum$PostHoc_Layer_Main %>% mutate(Index = "Phylum richness")
+) %>%
+  select(Index, Contrast = contrast, Estimate = estimate, SE, df,
+         t_ratio = t.ratio, p_value = p.value) %>%
+  mutate(p_value = ifelse(is.na(p_value), "not estimable",
+                          ifelse(p_value < 0.0001, "<0.0001",
+                                 formatC(p_value, format = "f", digits = 4))))
+
+# combine site post-hoc tables
+posthoc_site_combined <- bind_rows(
+  results_for_excel_asv$PostHoc_Site_within_Layer %>% mutate(Index = "ASV richness"),
+  results_for_excel_phylum$PostHoc_Site_within_Layer %>% mutate(Index = "Phylum richness")
+) %>%
+  select(Index, Contrast = contrast, Estimate = estimate, SE, df,
+         t_ratio = t.ratio, p_value = p.value) %>%
+  mutate(p_value = ifelse(p_value < 0.0001, "<0.0001",
+                          formatC(p_value, format = "f", digits = 4)))
+
+# sheet overview / descriptions
+overview <- data.frame(
+  Sheet = c("ANOVA", "PostHoc_Layer", "PostHoc_Site"),
+  Description = c(
+    "Type III ANOVA results from linear mixed-effects models on log-transformed richness data (Satterthwaite's method) for ASV and phylum richness",
+    "Tukey-adjusted pairwise comparisons between soil layers, averaged over sites. 'not estimable' indicates comparisons involving the Oh horizon, which was not sampled at Bad Brückenau",
+    "Tukey-adjusted pairwise comparisons between sites, averaged over the six layers present at all sites (Oh excluded)"  )
+)
+
+# combine and write to file
+results_supplement <- list(
+  "Overview"      = overview,
+  "ANOVA"         = anova_combined,
+  "PostHoc_Layer" = posthoc_layer_combined,
+  "PostHoc_Site"  = posthoc_site_combined
+)
+
+write_xlsx(results_supplement, path = "stats/alpha_diversity.xlsx")
+```
+
+# Composition on phylum level
+```{r, eval = F}
+# agglomerate to phylum level and compute relative abundance per sample
+ps_aggregate <- tax_glom(ps, taxrank = "Phylum")
+ps_melted <- psmelt(ps_aggregate) %>%
+  group_by(Sample) %>%
+  mutate(RelativeAbundance = Abundance / sum(Abundance, na.rm = TRUE)) %>%
+  ungroup()
+
+# mean relative abundance per site, layer, and phylum
+summary_data <- ps_melted %>%
+  group_by(code, layer, Phylum) %>%
+  summarise(AverageAbundance = mean(RelativeAbundance, na.rm = TRUE),
+            .groups = "drop")
+
+# top 12 phyla by cumulative mean abundance
+top_phyla <- summary_data %>%
+  group_by(Phylum) %>%
+  summarise(TotalAbundance = sum(AverageAbundance, na.rm = TRUE)) %>%
+  arrange(desc(TotalAbundance)) %>%
+  slice_head(n = 12) %>%
+  pull(Phylum)
+
+# coverage check: community fraction captured by the top phyla
+mean_coverage <- ps_melted %>%
+  mutate(IsTop = Phylum %in% top_phyla) %>%
+  group_by(Sample, IsTop) %>%
+  summarise(SumAbundance = sum(RelativeAbundance, na.rm = TRUE),
+            .groups = "drop") %>%
+  filter(IsTop) %>%
+  pull(SumAbundance) %>%
+  mean()
+
+message(sprintf("Top %d phyla cover %.1f%% of the community on average.",
+                length(top_phyla), mean_coverage * 100))
+
+# prepare plot data with ordered layer factor
+plot_data <- summary_data %>%
+  filter(Phylum %in% top_phyla) %>%
+  mutate(layer = factor(layer,
+                        levels = c("Ol0", "Ol1", "Olf", "Ohf", "Oh", "A5", "A10")))
+
+# colour palette for phyla
+color_palette <- c(
+  "#0072B2", "lightcoral", "#E69F00", "#FAD391", "#FF8C4D", "#CC79A7",
+  "#56B4E9", "#D55E00", "#78D2B7", "#009E73", "#F0E442", "#E09FD2",
+  "#117733", "#8C564B", "#5D3A9B"
+)
+
+# per-site facet strip colours
+site_strip_colors <- c(BBR = "#D55E00", MIT = "#009E73", KAN = "#0072B2")
+site_strip_list   <- lapply(site_strip_colors, function(col) {
+  element_rect(fill = col, color = "black", linewidth = 0.2)
+})
+
+# stacked area plot of phylum composition
+ggplot(plot_data, aes(x = layer, y = AverageAbundance,
+                      fill = Phylum, group = Phylum)) +
+  geom_area() +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_manual(values = color_palette) +
+  labs(y = "Relative Abundance") +
+  theme_bw(base_size = 8) +
+  theme(
+    strip.text       = element_text(size = 10),
+    strip.background = element_rect(fill = "white"),
+    axis.title.x     = element_blank(),
+    axis.text.x      = element_text(angle = 45, hjust = 1),
+    legend.title     = element_text(size = 8, face = "bold"),
+    legend.position  = "bottom"
+  ) +
+  facet_wrap2(~ code,
+              strip = ggh4x::strip_themed(background_x = site_strip_list))
+
+# ggsave("plots_final/composition_1.pdf", width = 13, height = 10, units = "cm", dpi = 400)
+
+
+# Supplementary tables: phylum abundances
+
+# format helper: scientific notation for very small values, fixed otherwise
+format_nice <- function(x) {
+  case_when(
+    x == 0        ~ "0",
+    abs(x) < 0.01 ~ formatC(x, format = "e", digits = 2),
+    TRUE          ~ formatC(x, format = "f", digits = 3)
+  )
+}
+
+# mean abundance per layer (across sites)
+table_layer_overall <- ps_melted %>%
+  group_by(layer, Phylum) %>%
+  summarise(Mean_Abundance = mean(RelativeAbundance, na.rm = TRUE),
+            .groups = "drop") %>%
+  group_by(Phylum) %>%
+  mutate(Total = sum(Mean_Abundance)) %>%
+  ungroup() %>%
+  arrange(desc(Total)) %>%
+  select(-Total) %>%
+  pivot_wider(names_from = layer, values_from = Mean_Abundance, values_fill = 0) %>%
+  mutate(across(where(is.numeric), format_nice))
+
+# mean abundance per layer and site
+table_layer_site <- ps_melted %>%
+  group_by(code, layer, Phylum) %>%
+  summarise(Mean_Abundance = mean(RelativeAbundance, na.rm = TRUE),
+            .groups = "drop") %>%
+  unite("Site_Layer", c(code, layer), sep = "_") %>%
+  group_by(Phylum) %>%
+  mutate(Total = sum(Mean_Abundance)) %>%
+  ungroup() %>%
+  arrange(desc(Total)) %>%
+  select(-Total) %>%
+  pivot_wider(names_from = Site_Layer, values_from = Mean_Abundance, values_fill = 0) %>%
+  mutate(across(where(is.numeric), format_nice))
+
+# collect supplementary tables for export
+export_list <- list(
+  "Phyla_per_Layer_Overall"  = table_layer_overall,
+  "Phyla_per_Layer_and_Site" = table_layer_site
+)
+
+# write_xlsx(export_list, path = "stats/phylum_abundances.xlsx")
+```
+
+# Beta diversity per layer
+```{r, eval = F}
+# loop over layers: PERMANOVA, mean between-site distance, beta-dispersion
+layers <- unique(metadata$layer)
+results_list <- list()
+for (cur_layer in layers) {
+  # subset to current layer and drop empty taxa
+  ps_sub <- subset_samples(ps, layer == cur_layer)
+  ps_sub <- prune_taxa(taxa_sums(ps_sub) > 0, ps_sub)
+  grouping <- sample_data(ps_sub)$code
+
+  # weighted UniFrac distances and group statistics
+  dist_mat <- phyloseq::distance(ps_sub, method = "wunifrac")
+  perm <- vegan::adonis2(dist_mat ~ grouping)
+  md   <- meandist(dist_mat, grouping)
+  disp <- vegan::betadisper(dist_mat, grouping)
+  disp_values <- disp$distances
+
+  # store one row per site pair
+  pair_names <- combn(rownames(md), 2, simplify = FALSE)
+  for (p in pair_names) {
+    pair_label <- paste(sort(p), collapse = " - ")
+    results_list[[paste(cur_layer, pair_label)]] <- data.frame(
+      label         = cur_layer,
+      pair          = pair_label,
+      R2            = perm[1, "R2"],
+      Distance      = md[p[1], p[2]],
+      Dispersion    = mean(disp_values),
+      Dispersion_SE = sd(disp_values) / sqrt(length(disp_values))
+    )
+  }
+}
+
+# reshape to long format and label metrics
+plot_data <- bind_rows(results_list) |>
+  pivot_longer(
+    cols      = c(R2, Distance, Dispersion),
+    names_to  = "metric_raw",
+    values_to = "value"
+  ) |>
+  mutate(
+    SE = case_when(
+      metric_raw == "Dispersion" ~ Dispersion_SE,
+      TRUE ~ 0
+    ),
+    metric_label = factor(case_match(metric_raw,
+      "R2"         ~ "PERMANOVA R²",
+      "Distance"   ~ "Between-Site Distance",
+      "Dispersion" ~ "Beta-Dispersion"
+    )),
+    label = factor(label, levels = c("Ol0", "Ol1", "Olf", "Ohf", "Oh", "A5", "A10"))
+  )
+
+# faceted plot: distance per site pair + R2/dispersion trends
+ggplot(plot_data, aes(x = label, y = value)) +
+  # dispersion error bars
+  geom_errorbar(
+    aes(ymin = value - SE, ymax = value + SE),
+    width = 0.1, linewidth = 0.3, color = "black",
+    data = subset(plot_data, metric_raw == "Dispersion")
+  ) +
+  # between-site distance lines per pair
+  geom_line(
+    aes(group = pair, linetype = pair),
+    data = subset(plot_data, metric_raw == "Distance"),
+    color = "black", linewidth = 0.5
+  ) +
+  geom_point(
+    data = subset(plot_data, metric_raw == "Distance"),
+    color = "black", size = 2
+  ) +
+  scale_linetype_manual(
+    values = c("BBR - KAN" = "solid", "BBR - MIT" = "dashed", "KAN - MIT" = "dotted"),
+    name = "Site Pair"
+  ) +
+  scale_shape_manual(
+    values = c("BBR - KAN" = 16, "BBR - MIT" = 17, "KAN - MIT" = 15),
+    name = "Site Pair"
+  ) +
+  # R2 and dispersion trend lines
+  geom_line(
+    aes(group = 1),
+    data = subset(plot_data, metric_raw != "Distance"),
+    color = "grey60", linewidth = 0.5
+  ) +
+  geom_point(
+    data = subset(plot_data, metric_raw != "Distance"),
+    size = 2, color = "black"
+  ) +
+  # pair labels on the first layer only
+  geom_label_repel(
+    aes(label = pair),
+    data = subset(plot_data, metric_raw == "Distance" & label == "Ol0"),
+    size = 2, fill = "white",
+    label.size = NA, show.legend = FALSE, label.padding = 0.1, segment.color = "grey50"
+  ) +
+  facet_wrap(~ metric_label, ncol = 1, scales = "free_y") +
+  labs(x = NULL) +
+  theme_bw(base_size = 8) +
+  theme(
+    axis.text.x      = element_text(angle = 45, hjust = 1, color = "black"),
+    strip.background = element_rect(fill = "white", color = "black"),
+    strip.text       = element_text(size = 7),
+    axis.title.y     = element_blank(),
+    legend.position  = "none",
+  )
+
+ggsave("plots/beta_per_layer.pdf", width = 7, height = 10, units = "cm")
+```
+
+# NMDS
+```{r, eval = F}
+# weighted UniFrac distances
+dist_wunifrac <- phyloseq::distance(ps, method = "wunifrac")
+
+# NMDS ordination and stress
+nmds_wunifrac <- ordinate(ps, method = "NMDS", distance = dist_wunifrac)
+round(nmds_wunifrac$stress, 3)
+
+# extract site scores and join sample metadata
+nmds_scores <- as.data.frame(scores(nmds_wunifrac, "sites"))
+nmds_scores <- cbind(nmds_scores, data.frame(sample_data(ps)))
+
+# point shapes per layer
+shapes_layer <- c(16, 15, 17, 18, 3, 4, 8)
+
+# NMDS plot: colour by site, shape by layer
+ggplot(nmds_scores, aes(x = NMDS1, y = NMDS2)) +
+  geom_point(size = 2.5, alpha = 1, aes(shape = layer, color = code)) +
+  stat_ellipse(aes(group = layer),
+               level    = 0.95,
+               linetype = "dashed",
+               alpha    = 0.4,
+               color    = "black") +  
+  scale_shape_manual(values = shapes_layer) +
+  scale_color_manual(values = colors_site) +
+  labs(color = "Site", shape = "Layer") +
+  theme_bw(base_size = 8) +
+  theme(
+    legend.title    = element_text(size = 8, face = "bold"),
+    legend.position = "bottom"
+  )
+
+#ggsave("plots_final/nmds.pdf", width = 13, height = 10, units = "cm")
+
+# PERMANOVA on layer x site, blocked by quantitative pit
+permanova_res <- vegan::adonis2(dist_wunifrac ~ layer * site, data = metadata,
+                                by = "term", strata = metadata$qpit)
+permanova_export <- as.data.frame(permanova_res) %>%
+  rownames_to_column("Term")
+
+#write_xlsx(list("PERMANOVA_Results" = permanova_export), path = "stats/permanova_wunifrac.xlsx")
+```
+
+# 16S GCN
+```{r, eval = F}
+# extract OTU matrix and matching gene copy number predictions
+otu <- as(otu_table(ps), "matrix")
+gcn <- read.csv("raw_data/gcn_predictions.csv") %>%
+  filter(index %in% row.names(otu)) %>%
+  pull(predicted_copy_number)
+
+# correct counts by copy number -> estimated cell counts
+otu_corrected <- sweep(otu, 1, gcn, FUN = "/")
+
+# per-sample read totals, cell totals, and average GCN
+total_reads_per_sample <- colSums(otu)
+total_cells_per_sample <- colSums(otu_corrected)
+average_gcn_per_sample  <- total_reads_per_sample / total_cells_per_sample
+
+# weighted SD of GCN per sample (weighted by corrected abundance)
+weighted_sd_per_sample <- sapply(1:ncol(otu_corrected), function(i) {
+  weights      <- otu_corrected[, i]
+  present_asvs <- weights > 0
+  sqrt(Hmisc::wtd.var(x = gcn[present_asvs],
+                      weights = weights[present_asvs]))
+})
+names(weighted_sd_per_sample) <- colnames(otu)
+
+# assemble result data frame and join metadata
+gcn_df <- data.frame(
+  gcn      = average_gcn_per_sample,
+  sd_indiv = weighted_sd_per_sample
+) %>%
+  rownames_to_column("nr") %>%
+  left_join(metadata %>% dplyr::select(layer, code, nr, qpit, site), by = "nr")
+
+# mean and SD per layer and site for plotting
+gcn_df_plot <- gcn_df %>%
+  group_by(layer, code) %>%
+  summarise(
+    mean = mean(gcn, na.rm = TRUE),
+    sd   = sd(gcn, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# plot average GCN by layer and site
+ggplot(gcn_df_plot, aes(x = layer, y = mean, color = code, group = code)) +
+  geom_errorbar(
+    aes(ymin = mean - sd, ymax = mean + sd),
+    position = position_dodge(width = 0.5),
+    width    = 0.25,
+    color    = "black"
+  ) +
+  geom_point(position = position_dodge(width = 0.5), size = 2.5) +
+  scale_color_manual(values = colors_site) +
+  labs(
+    y     = "Average GCN",
+    color = "Site"
+  ) +
+  theme_bw(base_size = 8) +
+  theme(
+    axis.title.x    = element_blank(),
+    axis.text.x     = element_text(angle = 45, hjust = 1),
+    legend.title    = element_text(size = 8, face = "bold"),
+    legend.position = "none"
+  )
+
+#ggsave("plots/gcn.pdf", width = 7, height = 10, units = "cm", dpi = 600)
+
+# Statistical testing
+
+# check variance homogeneity
+gcn_df$group_check <- interaction(gcn_df$layer, gcn_df$site)
+leveneTest(gcn ~ group_check, data = gcn_df)
+
+# linear mixed model and Type III ANOVA
+model_gcn_lmm <- lmer(gcn ~ code * layer + (1 | qpit), data = gcn_df)
+anova_summary <- broom.mixed::tidy(anova(model_gcn_lmm, type = 3))
+print(anova_summary)
+
+# post hoc: layer main effect and site within layer
+emm_layer       <- emmeans(model_gcn_lmm, specs = pairwise ~ layer, weights = "cells")
+emm_interaction <- emmeans(model_gcn_lmm, specs = pairwise ~ code | layer)
+res_layer       <- as.data.frame(emm_layer$contrasts)
+res_interaction <- as.data.frame(emm_interaction$contrasts)
+
+# mean and SD per layer and per layer x site
+means_layer <- gcn_df %>%
+  group_by(layer) %>%
+  summarise(mean = mean(gcn, na.rm = TRUE),
+            sd   = sd(gcn, na.rm = TRUE),
+            .groups = "drop")
+
+means_site_layer <- gcn_df %>%
+  group_by(layer, site) %>%
+  summarise(mean = mean(gcn, na.rm = TRUE),
+            sd   = sd(gcn, na.rm = TRUE),
+            .groups = "drop")
+
+# collect results for export
+results_for_excel <- list(
+  "LMM_ANOVA_Summary"         = anova_summary,
+  "PostHoc_Layer_Main"        = res_layer,
+  "PostHoc_Site_within_Layer" = res_interaction,
+  "Means_Raw_Site_Layer"      = means_site_layer,
+  "Means_Raw_Layer"           = means_layer
+)
+
+#write_xlsx(results_for_excel, path = "stats/gcn_lmm.xlsx")
+```
+
+# Indicator genus
+```{r, eval = F}
+site_levels  <- c("BBR", "MIT", "KAN")
+layer_levels <- c("Ol0", "Ol1", "Olf", "Ohf", "Oh", "A5", "A10")
+
+# Aggregation to genus level
+
+# agglomerate to genus and assign unique genus names
+ps_genus <- tax_glom(ps, taxrank = "Genus", NArm = TRUE)
+taxa_names(ps_genus) <- make.unique(as.character(tax_table(ps_genus)[, "Genus"]))
+
+# relative abundances with ordered site factor
+ps_rel <- microbiome::transform(ps_genus, "compositional")
+sample_data(ps_rel)$code <- factor(sample_data(ps_rel)$code, levels = site_levels)
+
+# identify core genera per site within each layer
+detection_core  <- 0.003
+prevalence_core <- 0.8
+
+all_core_genera <- c()
+
+for (current_layer in layer_levels) {
+  ps_layer <- subset_samples(ps_rel, layer == current_layer)
+  sites    <- unique(as.character(sample_data(ps_layer)$code))
+
+  for (current_code in sites) {
+    ps_subset <- subset_samples(ps_layer, code == current_code)
+    all_core_genera <- c(all_core_genera,
+                        core_members(ps_subset,
+                                     detection  = detection_core,
+                                     prevalence = prevalence_core))
+  }
+}
+
+# keep only core genera
+ps_filtered <- prune_taxa(unique(all_core_genera), ps_genus)
+
+# indicator species analysis per layer
+all_indicators_df <- data.frame()
+set.seed(123)
+
+for (current_layer in layer_levels) {
+  ps_subset <- subset_samples(ps_filtered, layer == current_layer)
+
+  # genus x sample table and site grouping
+  otu_subset    <- otu_table(ps_subset) %>% data.frame() %>% t()
+  groups_subset <- factor(sample_data(ps_subset)$code, levels = site_levels)
+
+  # group-equalized indicator value analysis
+  indval_res <- multipatt(otu_subset, groups_subset,
+                          func    = "IndVal.g",
+                          duleg   = TRUE,
+                          control = how(nperm = 999))
+
+  # BH-adjusted p-values
+  layer_results <- indval_res$sign %>%
+    as.data.frame() %>%
+    rownames_to_column("genus") %>%
+    mutate(q_value = p.adjust(p.value, method = "BH"))
+
+  # tag with site and layer, then collect
+  if (nrow(layer_results) > 0) {
+    layer_results <- layer_results %>%
+      mutate(
+        code  = levels(groups_subset)[index],
+        layer = current_layer
+      )
+    all_indicators_df <- bind_rows(all_indicators_df, layer_results)
+  }
+}
+
+# top 3 indicators per site x layer
+data <- all_indicators_df %>%
+  select(genus, stat, p.value, q_value, code, layer) %>%
+  filter(p.value <= 0.05) %>%
+  group_by(code, layer) %>%
+  arrange(desc(stat)) %>%
+  slice_head(n = 3) %>%
+  ungroup()
+
+# taxonomy lookup with renaming
+tax <- tax_table(ps_genus) %>%
+  data.frame() %>%
+  rownames_to_column("genus") %>%
+  select(genus, Genus) %>%
+  mutate(Genus = str_replace(Genus,
+                            "Burkholderia-Caballeronia-Paraburkholderia",
+                            "Burkholderia s.l."))
+
+# join taxonomy and format labels (italic genus names)
+data_1 <- left_join(data, tax, by = "genus") %>%
+  mutate(
+    layer           = factor(layer, levels = layer_levels),
+    code            = factor(code,  levels = site_levels),
+    Genus_formatted = paste0("<i>", Genus, "</i>")
+  )
+
+# mean relative abundance per genus, site, and layer (point size)
+abund_data <- psmelt(ps_rel) %>%
+  group_by(OTU, code, layer) %>%
+  summarise(MeanAbund = mean(Abundance), .groups = "drop") %>%
+  dplyr::rename(genus = OTU)
+
+data_sized <- data_1 %>%
+  left_join(abund_data, by = c("genus", "code", "layer"))
+
+# plot: indicator value vs genus, faceted by site
+ggplot(data_sized, aes(
+    y     = reorder_within(Genus_formatted,
+                          (-as.numeric(as.factor(layer)) * 1e6) + stat, code),
+    x     = stat,
+    color = layer,
+    size  = MeanAbund
+  )) +
+  geom_point(shape = 16, alpha = 0.75) +
+  scale_y_reordered() +
+  scale_size_continuous(
+    breaks = c(0.001, 0.005, 0.01, 0.05, 0.1),
+    name   = "Rel. Abund.",
+    range  = c(0.5, 4),
+    labels = scales::percent
+  ) +
+  scale_color_manual(name = "Layer", values = colors_horizon) +
+  facet_wrap(~ code, scales = "free_y", ncol = 1) +
+  labs(x = "Indicator Value", y = "Genus") +
+  theme_bw(base_size = 8) +
+  theme(
+    axis.title.y    = element_blank(),
+    axis.text.y     = element_markdown(angle = 0, hjust = 1, size = 7),
+    axis.text.x     = element_text(angle = 0, hjust = 0.5),
+    legend.title    = element_text(size = 8, face = "bold"),
+    legend.position = "top",
+    legend.box      = "vertical",
+    legend.margin   = margin(0, 0, 0, 0)
+  ) +
+  guides(
+    color = guide_legend(order = 1, nrow = 1),
+    size  = guide_legend(order = 2, nrow = 1)
+  )
+
+#ggsave("plots/indispecies_genus.pdf", width = 8.5, height = 12, units = "cm")
+# write_xlsx(data_sized, path = "stats/indicator_genera.xlsx")
+```
+
+# RDA per layer
+```{r, eval = F}
+
+set.seed(123)
+
+# STEP 1: driver screening per layer
+
+# full predictor set (overwritten by the reduced set below)
+all_predictors <- c( "CN", "CP", "Ca_tot", "Al_tot", "K_tot", "Mg_tot",
+                              "Mn_tot", "Na_tot", "p_i_citrate", "p_org_citrate", "p_total_citrate",
+                              "Fe_tot", "TOC", "P_tot", "pH", "Al_exch", "Ca_exch", "Fe_exch", "K_exch",
+                     "Mg_exch", "Mn_exch", "Na_exch")
+# reduced predictor set actually used in the screening
+all_predictors <- c( "CN", "CP", "p_total_citrate",
+                     "pH", "Al_exch", "Ca_exch", "Fe_exch", "K_exch",
+                     "Mg_exch", "Mn_exch", "Na_exch")
+# all_predictors <- c(
+#   "TOC", "N_tot", "P_tot", "CN", "CP", "pH", "KAK", "BS",
+#   "Al_tot", "Ca_tot", "Fe_tot", "K_tot", "Mg_tot", "Mn_tot", "Na_tot",
+#     "p_i_citrate", "p_org_citrate", "p_total_citrate",
+#     "Al_oxal", "Fe_oxal", "Mn_oxal", "P_oxal",
+#     "Al_exch", "Ca_exch", "Fe_exch", "K_exch", "Mg_exch", "Mn_exch", "Na_exch", "H_exch"
+# )
+
+driver_screening_results <- list()
+
+# screen each layer (skip the first layer)
+for (current_layer in layers[2:7]) {
+
+  print(current_layer)
+  ps_sub <- subset_samples(ps, layer == current_layer)
+  metadata_sub <- sample_data(ps_sub) %>% data.frame()
+
+  current_layer_results_list <- list()
+
+  # test each predictor
+  for (predictor in all_predictors) {
+
+        test_data <- metadata_sub %>%
+        select(all_of(predictor), site) %>%
+        drop_na()
+
+        # does the variable differ by site?
+        lm_model <- lm(as.formula(paste(predictor, "~ site")), data = test_data)
+        p_val_site <- anova(lm_model)$"Pr(>F)"[1]
+
+        # does the variable impact the microbiome?
+        ps_test <- prune_samples(rownames(test_data), ps_sub)
+        dist_test <- phyloseq::distance(ps_test, method = "wunifrac")
+
+        model_adonis <- adonis2(as.formula(paste("dist_test ~", predictor)),
+                                data = test_data,
+                                permutations = 999)
+        p_val_microbe <- model_adonis$"Pr(>F)"[1]
+
+        # save per-predictor results
+        current_layer_results_list[[predictor]] <- data.frame(
+          variable = predictor,
+          p_val_site = p_val_site,
+          p_val_microbe = p_val_microbe
+    )
+  }
+
+  # combine, BH-correct, and keep predictors significant on both fronts
+  shortlist_drivers <- dplyr::bind_rows(current_layer_results_list) %>%
+    mutate(Layer = current_layer) %>%
+    mutate(q_val_site = p.adjust(p_val_site, "BH"),
+           q_val_microbe = p.adjust(p_val_microbe, "BH")) %>%
+    filter(q_val_site < 0.05 & q_val_microbe < 0.05)
+
+  # VIF filtering to drop collinear predictors
+  if (nrow(shortlist_drivers) > 1)
+    {
+    print("going in: ")
+    print(paste(shortlist_drivers$variable))
+    vif_data <- metadata_sub %>%
+      select(all_of(shortlist_drivers$variable)) %>%
+      drop_na()
+    vif_test <- usdm::vifstep(vif_data, th = 10)
+
+    # final filtering by VIF
+    shortlist_drivers <- shortlist_drivers %>%
+      filter(variable %in% vif_test@results$Variables)
+    print("going out: ")
+    print(paste(shortlist_drivers$variable))
+   }
+  else
+    {
+    print(current_layer)
+    print("<2 drivers, skipping vif")
+    }
+
+
+  # collect final driver list for this layer
+  driver_screening_results[[current_layer]] <- shortlist_drivers
+  #print(shortlist_drivers)
+
+  rm(test_data, ps_test,
+     model_adonis, lm_model,
+     current_layer_results_list,
+     p_val_microbe,
+     p_val_site,
+     vif_data, predictor)
+}
+
+
+# STEP 2: dbRDA using those drivers
+
+dbrda_results_list <- list()
+dbrda_model_list <- list()
+dbrda_margin_results_list <- list()
+
+# per-layer dbRDA
+for (current_layer in layers[2:7]) {
+
+  # setup
+  ps_sub <- subset_samples(ps, layer == current_layer)
+  metadata_sub <- sample_data(ps_sub) %>% data.frame()
+
+  # drivers selected for this layer
+  layer_drivers <- driver_screening_results[[current_layer]]$variable
+
+  # skip dbRDA if there are no drivers
+  if (length(layer_drivers) == 0) {
+    print("No significant drivers found. Skipping dbRDA.")
+    next
+  }
+
+  # complete-case env data for the RDA
+  env_data_rda <- metadata_sub %>%
+    select(all_of(layer_drivers)) %>%
+    drop_na()
+  # distance matrix matching the complete-case samples
+  dist_rda <- phyloseq::distance(prune_samples(rownames(env_data_rda), ps_sub),
+                                   method = "wunifrac")
+
+  # build formula dynamically from drivers
+  model_formula <- as.formula(paste("dist_rda ~", paste(layer_drivers, collapse = " + ")))
+  # fit dbRDA
+  model_dbrda <- dbrda(model_formula, data = env_data_rda)
+
+  # adjusted R squared
+  r2_adj <- RsquareAdj(model_dbrda)$adj.r.squared
+
+  # overall model significance
+  model_anova <- anova.cca(model_dbrda, permutations = 999)
+  p_value <- model_anova$"Pr(>F)"[1]
+
+  # save overall results
+  dbrda_results_list[[current_layer]] <- data.frame(
+    Layer = current_layer,
+    Adj_R_Squared = r2_adj,
+    P_Value = p_value,
+    Model_Formula = paste(layer_drivers, collapse = " + ")
+  )
+
+  # marginal (by-term) significance
+  model_anova_terms <- anova.cca(model_dbrda, by = "margin", permutations = 999)
+  # save term-level results
+  if (nrow(model_anova_terms) > 0) {
+      term_results_df <- as.data.frame(model_anova_terms)
+      term_results_df$variable <- rownames(term_results_df)
+      term_results_df$layer <- current_layer
+      term_results_df <- term_results_df %>% filter(variable != "Residual")
+      dbrda_margin_results_list[[current_layer]] <- term_results_df
+    }
+
+  # store fitted model
+  dbrda_model_list[[current_layer]] <- model_dbrda
+
+
+}
+
+# combine across layers
+dbrda_results <- dplyr::bind_rows(dbrda_results_list)
+dbrda_margin_results <- dplyr::bind_rows(dbrda_margin_results_list)
+
+# clean up workspace
+rm(dbrda_results_list, current_layer, layer_drivers, dist_test, driver_screening_results, env_data_rda, all_predictors, dbrda_margin_results_list, term_results_df, model_anova, model_anova_terms, vif_test, shortlist_drivers, metadata_sub, model_dbrda, ps_sub, model_formula, p_value, r2_adj, dist_rda)
+
+
+# summarise drivers retained per layer
+final_drivers_summary <- dbrda_margin_results %>%
+  # keep only layer and driver name
+  dplyr::select(layer, variable) %>%
+  group_by(layer) %>%
+  # collapse all drivers into one string
+  summarise(
+    N_Drivers = n(),
+    Drivers_Used = paste(variable, collapse = "; "),
+    .groups = "drop"
+  ) %>%
+  dplyr::rename(Layer = layer)
+
+# overall model results (adjusted R2)
+dbrda_results_clean <- dbrda_results %>%
+  dplyr::select(Layer, Adj_R_Squared, P_Value) %>%
+  # round for clean output
+  mutate(
+    Adj_R_Squared = round(Adj_R_Squared, 3),
+    P_Value = round(P_Value, 3)
+  )
+
+# marginal term analysis (contribution of each variable)
+dbrda_margin_results_clean <- dbrda_margin_results %>%
+  # the column is named 'Rsquare', not 'R2'
+  dplyr::select(layer, variable, Rsquare, F, `Pr(>F)`) %>%
+  dplyr::rename(
+    Layer = layer,
+    Term = variable,
+    R2 = Rsquare,
+    P_Value = `Pr(>F)`
+  ) %>%
+  mutate(
+    R2 = round(R2, 3),
+    F = round(F, 3),
+    P_Value = round(P_Value, 3)
+  )
+
+# collect all results for export
+results_for_excel_rda <- list(
+  "Overall_Model_R2" = dbrda_results_clean,
+  "Significant_Drivers_Summary" = final_drivers_summary,
+  "Marginal_Term_Analysis" = dbrda_margin_results_clean
+)
+
+#write_xlsx(results_for_excel_rda, path = "stats/dbrda_analysis_simple.xlsx")
+```
+
+# global RDA
+```{r, eval = F}
+set.seed(123)
+
+# data preparation
+
+# candidate predictors
+all_predictors <- c("CN", "CP", "p_total_citrate", "pH",
+                    "Al_exch", "Ca_exch", "Fe_exch", "K_exch",
+                    "Mg_exch", "Mn_exch", "Na_exch")
+
+# subset phyloseq (exclude Ol0)
+ps_sub <- subset_samples(ps, layer != "Ol0")
+
+# extract metadata, drop NAs, z-standardize predictors
+env_data <- sample_data(ps_sub) %>%
+  data.frame() %>%
+  dplyr::select(all_of(all_predictors)) %>%
+  na.omit() %>%
+  scale() %>%
+  as.data.frame()
+
+# match phyloseq samples to complete-case metadata
+complete_samples <- rownames(env_data)
+ps_run           <- prune_samples(complete_samples, ps_sub)
+
+# weighted UniFrac distance matrix
+dist_wunifrac <- phyloseq::distance(ps_run, method = "wunifrac")
+
+
+
+# model selection
+
+# null model (intercept only) and full model (all predictors)
+dbrda_null <- dbrda(dist_wunifrac ~ 1, data = env_data)
+dbrda_full <- dbrda(dist_wunifrac ~ ., data = env_data)
+
+# forward selection with double stopping criterion (p-value + adj. R2)
+dbrda_final <- ordiR2step(dbrda_null,
+                          scope        = formula(dbrda_full),
+                          direction    = "forward",
+                          permutations = 999,
+                          trace        = 0)
+
+print("Selected model:")
+print(dbrda_final$call)
+
+
+
+# statistics
+
+# A) overall model fit 
+r2_adj_overall <- RsquareAdj(dbrda_final)$adj.r.squared
+anova_overall  <- anova.cca(dbrda_final, permutations = 999)
+p_val_overall  <- anova_overall$`Pr(>F)`[1]
+
+print(paste0("RESULT FOR TEXT: The final model explains ",
+             round(r2_adj_overall * 100, 1), "% of variance (adj. R2) with p = ",
+             p_val_overall))
+
+# B) marginal effects per variable 
+anova_marginal <- anova.cca(dbrda_final, by = "margin", permutations = 999)
+
+# total inertia 
+total_inertia <- dbrda_final$tot.chi
+
+stats_marginal <- as.data.frame(anova_marginal) %>%
+  rownames_to_column(var = "Variable") %>%
+  filter(Variable != "Residual") %>%
+  mutate(
+    Var_Explained_Pct = (SumOfSqs / total_inertia) * 100,
+    SumOfSqs          = round(SumOfSqs, 3),
+    F_Value           = round(F, 3),
+    P_Value           = round(`Pr(>F)`, 3),
+    Var_Explained_Pct = round(Var_Explained_Pct, 1)
+  ) %>%
+  dplyr::select(Variable, SumOfSqs, Var_Explained_Pct, F_Value, P_Value)
+
+# overall ANOVA table for export
+stats_overall <- as.data.frame(anova_overall) %>%
+  rownames_to_column(var = "Term")
+
+# export to Excel
+output_list <- list(
+  "Overall_Model_Stats"  = stats_overall,
+  "Marginal_Drivers_S16" = stats_marginal
+)
+
+#write_xlsx(output_list, path = "stats/dbrda_global_analysis.xlsx")
+
+
+# plotting
+
+# site scores + metadata for aesthetics
+site_scores <- as.data.frame(scores(dbrda_final, display = "sites"))
+meta_plot   <- data.frame(sample_data(ps_run))
+site_scores <- cbind(site_scores, meta_plot[rownames(site_scores), ])
+
+# biplot scores (predictor arrows)
+arrow_scores <- as.data.frame(scores(dbrda_final, display = "bp"))
+arrow_scale  <- 0.5
+
+# axis labels: % of total inertia explained by dbRDA1 / dbRDA2
+eig       <- dbrda_final$CCA$eig
+var_axis1 <- round((eig[1] / sum(dbrda_final$tot.chi)) * 100, 1)
+var_axis2 <- round((eig[2] / sum(dbrda_final$tot.chi)) * 100, 1)
+
+# ordination plot with site points and predictor arrows
+ggplot() +
+  geom_point(data = site_scores,
+             aes(x = dbRDA1, y = dbRDA2, color = layer, shape = site),
+             size = 3) +
+  geom_segment(data = arrow_scores,
+               aes(x = 0, y = 0,
+                   xend = dbRDA1 * arrow_scale, yend = dbRDA2 * arrow_scale),
+               arrow = arrow(length = unit(0.25, "cm")),
+               color = "black", alpha = 0.6) +
+  geom_text_repel(data = arrow_scores,
+                  aes(x = dbRDA1 * arrow_scale, y = dbRDA2 * arrow_scale,
+                      label = rownames(arrow_scores)),
+                  box.padding = 0.5, point.padding = 0.3,
+                  segment.color = "grey50") +
+  labs(x     = paste0("dbRDA1 (", var_axis1, "%)"),
+       y     = paste0("dbRDA2 (", var_axis2, "%)"),
+       color = "Layer",
+       shape = "Site") +
+  scale_color_manual(values = colors_horizon[-1]) +
+  theme_bw(base_size = 11) +
+  coord_fixed() +
+  guides(color = guide_legend(nrow = 1), shape = guide_legend(nrow = 1)) +
+  theme(
+    legend.box = "vertical"
+  )
+
+#ggsave("plots/Global_dbRDA.pdf", width = 15, height = 16, units = "cm")
+```
+
+# Cores
+```{r, eval = F}
+
+# agglomerate to genus 
+ps_genus <- tax_glom(ps, taxrank = "Genus", NArm = TRUE)
+
+taxa_names(ps_genus) <- as.character(tax_table(ps_genus)[, "Genus"])
+ps_genus <- subset_taxa(ps_genus, !grepl(" G\\.$", taxa_names(ps_genus)))
+
+ps_genus_rel <- microbiome::transform(ps_genus, "compositional")
+
+# core parameters
+detection_core <- 0.01
+prevalence_core <- 0.8
+
+sample_data(ps_genus_rel)$code <- as.character(sample_data(ps_genus_rel)$code)
+cores <- setNames(vector("list", length(layers)), layers)
+
+# shared core across sites within each layer
+for (current_layer in layers) {
+  ps_layer_only <- subset_samples(ps_genus_rel, layer == current_layer)
+  sites_in_this_layer <- unique(sample_data(ps_layer_only)$code)
+  venn_list <- list()
+  for (current_site in sites_in_this_layer) {
+
+    ps_subset <- subset_samples(ps_layer_only, code == current_site)
+        venn_list[[current_site]] <- core_members(ps_subset,
+                                              detection = detection_core,
+                                              prevalence = prevalence_core)
+  }
+
+  # core = intersection of cores
+  cores[[current_layer]] <- Reduce(intersect, venn_list)
+}
+
+print(cores)
+# save(cores, file = "r_objects/core_microbiomes_genus.RData")
+
+
+# core read abundance
+#load("r_objects/core_microbiomes_genus.RData")
+print("READ COVERAGE BY CORE TAXA:")
+
+# mean read coverage of core taxa per layer
+for (current_layer in names(cores)) {
+  core_taxa_names <- cores[[current_layer]]
+    ps_layer <- subset_samples(ps_genus_rel, layer == current_layer)
+    ps_core_only <- prune_taxa(core_taxa_names, ps_layer)
+    coverage_per_sample <- sample_sums(ps_core_only)
+    mean_cov <- mean(coverage_per_sample) * 100
+    sd_cov   <- sd(coverage_per_sample) * 100
+    cat(sprintf("Layer %s: core (%d genera) covers on average %.2f%% (+/- %.2f%%) of reads.\n",
+                current_layer, length(core_taxa_names), mean_cov, sd_cov))
+
+}
+```
+
+## cores heatmap
+```{r, eval = F}
+# load("r_objects/core_microbiomes_genus_per_layer.RData")
+
+# order taxa
+test <- cores[[1]]
+ps_OL0 <- subset_samples(ps_genus, layer == layers[1]) 
+ps_OL0_rel <- microbiome::transform(ps_OL0, "compositional")
+ps_OL0_pr <- prune_taxa(test, ps_OL0_rel)
+
+# sort by total abundance
+test2 <- taxa_sums(ps_OL0_pr) %>%
+  tibble::enframe(name = "TaxonID", value = "Sum") %>%
+  arrange(desc(Sum)) %>%
+  pull(TaxonID)
+cores[[1]] <- test2
+
+
+# prepare data for the heatmap
+cores_total <- na.omit(Reduce(union, cores))
+
+# prune to core taxa and convert to relative abundance
+ps_sub <- prune_taxa(cores_total, ps_genus)
+ps_sub <- microbiome::transform(ps_sub, "compositional")
+
+otu_matrix <- otu_table(ps_sub) %>% data.frame()
+metadata <- data.frame(sample_data(ps_sub)) 
+
+
+# average abundances per site and layer
+avg_otu_matrix <- otu_matrix %>%
+  rownames_to_column(var = "taxon") %>%
+  pivot_longer(-taxon, names_to = "nr", values_to = "abundance") %>%
+  mutate(nr = str_remove(nr, "^X")) %>%
+  left_join(
+    metadata %>% select(nr, code, site, layer), by = "nr"
+  ) %>%
+  group_by(taxon, layer, code) %>%
+  summarise(mean_abundance = mean(abundance), .groups = "drop") %>%
+  pivot_wider(names_from = c(layer, code), values_from = mean_abundance, names_sep = "_") %>%
+  column_to_rownames(var = "taxon") %>%
+  as.matrix()
+
+
+# column metadata
+column_meta_avg <- data.frame(col_name = colnames(avg_otu_matrix)) %>%
+  separate(col_name, into = c("layer", "site"), sep = "_", remove = FALSE)
+
+column_meta_avg$layer <- factor(column_meta_avg$layer, levels = layers)
+column_meta_avg <- column_meta_avg %>% arrange(layer, site)
+
+# reorder matrix by taxa and ordered columns
+avg_otu_matrix <- avg_otu_matrix[cores_total, column_meta_avg$col_name]
+
+
+# core membership matrix
+core_membership_matrix <- sapply(cores, function(core_taxa) {
+  as.integer(cores_total %in% core_taxa)
+})
+rownames(core_membership_matrix) <- cores_total
+colnames(core_membership_matrix) <- names(cores)
+
+
+# annotations and colours
+taxa_labels <- rownames(avg_otu_matrix)
+
+col_fun <- colorRamp2(c(0, 0.01, 0.05, 0.2), viridis(4))
+
+left_ann <- rowAnnotation(
+  "Core Membership" = anno_simple(
+    core_membership_matrix,
+    border = TRUE,
+    gp = gpar(col = "white")
+  )
+)
+
+right_ann <- rowAnnotation(
+  Name = anno_text(taxa_labels, just = "left", gp = gpar(fontsize = 8))
+)
+
+
+# heatmap
+hm_main_avg <- Heatmap(
+  avg_otu_matrix,
+  name = "Mean Rel. Abundance",
+  col = col_fun,
+  left_annotation = left_ann,
+  right_annotation = right_ann,
+  column_split = column_meta_avg$layer,
+  column_labels = column_meta_avg$site,
+  column_names_rot = 45,
+
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+
+  row_order = cores_total,
+  show_row_names = FALSE,
+  use_raster = TRUE
+)
+
+hm_main_avg
+
+# pdf("plots_final/cores_heatmap.pdf", width = 25/2.54, height = 15/2.54)
+# draw(hm_main_avg, heatmap_legend_side = "right", annotation_legend_side = "right")
+# dev.off()
+```
+
+## cores abundance
+```{r, eval = F}
+
+# initialize results table
+core_summary_table <- tibble()
+
+for (current_layer in names(cores)) {
+
+  ps_layer <- subset_samples(ps_genus_rel, layer == current_layer)
+  # keep only genera present in this layer (sum > 0)
+  ps_layer <- prune_taxa(taxa_sums(ps_layer) > 0, ps_layer)
+  # genus counts (number and percentage)
+  core_taxa_names <- cores[[current_layer]]
+  n_core_genera   <- length(core_taxa_names)
+  n_total_genera  <- ntaxa(ps_layer)
+  perc_genera     <- (n_core_genera / n_total_genera) * 100
+
+  # read coverage (mean)
+  ps_core_only   <- prune_taxa(core_taxa_names, ps_layer)
+  cov_per_sample <- sample_sums(ps_core_only)
+
+  mean_read_cov <- mean(cov_per_sample) * 100
+  sd_read_cov   <- sd(cov_per_sample) * 100
+
+  # append to table
+  core_summary_table <- bind_rows(core_summary_table, tibble(
+    Layer = current_layer,
+    n_Genera_Core = n_core_genera,
+    n_Genera_Total = n_total_genera,
+    Pct_Genera_Core = perc_genera,
+    Pct_Reads_Core_Mean = mean_read_cov,
+    Pct_Reads_Core_SD = sd_read_cov
+  ))
+}
+
+# round for cleaner output
+final_table <- core_summary_table %>%
+  mutate(across(starts_with("Pct"), ~ round(., 2)))
+
+# write_xlsx(final_table, "stats/core_summary_stats.xlsx")
+
+```
+
+# outlier identification
+```{r, eval = F}
+
+# PCoA 
+ps_rel <- transform_sample_counts(ps_nonorm, function(x) x / sum(x))
+pcoa   <- ordinate(ps_rel, method = "PCoA", distance = "bray")
+
+# data prep: extract scores and flag the suspected outlier pit
+pcoa_df <- data.frame(pcoa$vectors[, 1:2]) %>%
+  bind_cols(data.frame(sample_data(ps_rel))) %>%
+  mutate(Status = ifelse(qpit == "KAN.1", "Outlier", "Retained"),
+         Label = ifelse(qpit == "KAN.1", as.character(layer), NA_character_))
+
+# global centroid and per-pit distance to it
+global_cent <- colMeans(pcoa$vectors[, 1:2])
+dist_df <- pcoa_df %>%
+  group_by(qpit) %>%
+  summarise(Axis1 = mean(Axis.1), Axis2 = mean(Axis.2), .groups = "drop") %>%
+  rowwise() %>%
+  mutate(
+    Dist = sqrt((Axis1 - global_cent[1])^2 + (Axis2 - global_cent[2])^2),
+    Color = ifelse(qpit == "KAN.1", "red", "grey20")
+  ) %>%
+  arrange(desc(Dist))
+
+# plotting
+
+# PCoA ordination, outlier highlighted
+p1 <- ggplot(pcoa_df, aes(Axis.1, Axis.2, color = Status, shape = Status)) +
+  geom_point(size = 3, alpha = 0.8) +
+  scale_color_manual(values = c("red", "grey20")) +
+  labs(x = "PCoA 1", y = "PCoA 2") +
+  theme_bw(base_size = 10) +
+  theme(legend.position = "bottom") +
+  geom_text_repel(
+    aes(label = Label),
+    size = 3,
+    min.segment.length = 0,
+    box.padding = 0.5,
+    max.overlaps = Inf,
+    show.legend = FALSE
+  )
+
+# per-pit distance to global centroid
+p2 <- ggplot(dist_df, aes(x = reorder(qpit, -Dist), y = Dist, fill = Color)) +
+  geom_col(show.legend = FALSE) +
+  scale_fill_identity() +
+  labs(x = "Quantitative Pit", y = "Distance to Centroid") +
+  theme_bw(base_size = 8) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "bottom")
+
+# combine panels
+ggarrange(p1, p2, widths = c(2, 1.5))
+
+#ggsave("plots_final/S2_Outlier_Check.pdf", p1 + p2, width = 20, height = 10, units = "cm")
+```
+
+# alpha diversity ASV and phylum (Shannon & Pielou)
+```{r, eval = F}
+# rarefy to even depth (minimum sample size)
+set.seed(1)
+ps_rare <- rarefy_even_depth(
+  ps_nonorm,
+  sample.size = min(sample_sums(ps_nonorm)),
+  rngseed     = 42,
+  replace     = FALSE,
+  trimOTUs    = TRUE,
+  verbose     = TRUE
+)
+
+# helper: extract alpha indices + sample data
+get_alpha <- function(ps) {
+  data.frame(
+    shannon = estimate_richness(ps, measures = "Shannon")$Shannon,
+    pielou  = evenness(ps, index = "pielou")$pielou,
+    data.frame(sample_data(ps))
+  )
+}
+
+# helper: summarise per code x layer
+summarise_alpha <- function(df) {
+  df %>%
+    group_by(code, layer) %>%
+    summarise(
+      mean_shannon = mean(shannon),
+      sd_shannon   = sd(shannon),
+      mean_pielou  = mean(pielou),
+      sd_pielou    = sd(pielou),
+      .groups = "drop"
+    ) %>%
+    arrange(layer)
+}
+
+# helper: plot mean +/- SD by layer and site
+plot_alpha <- function(df, y_mean, y_sd, ylab) {
+  ggplot(df, aes(x = layer, y = .data[[y_mean]], group = code)) +
+    geom_errorbar(
+      aes(ymin = .data[[y_mean]] - .data[[y_sd]],
+          ymax = .data[[y_mean]] + .data[[y_sd]]),
+      position = position_dodge(width = 0.5),
+      width = 0.25, color = "black"
+    ) +
+    geom_point(position = position_dodge(width = 0.5),
+               size = 2.5, aes(color = code)) +
+    scale_color_manual(values = colors_site) +
+    labs(y = ylab, x = "Layer", color = "Site") +
+    theme_bw(base_size = 8) +
+    theme(
+      axis.title.x = element_blank(),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      legend.title = element_text(size = 8, face = "bold"),
+      legend.position = "none"
+    )
+}
+
+# ASV level
+alpha_asv  <- get_alpha(ps_rare)
+means_asv  <- summarise_alpha(alpha_asv)
+
+# phylum level
+ps_phylum  <- tax_glom(ps_rare, taxrank = "Phylum")
+alpha_phy  <- get_alpha(ps_phylum)
+means_phy  <- summarise_alpha(alpha_phy)
+
+# plots
+p1 <- plot_alpha(means_asv, "mean_shannon", "sd_shannon", "Shannon diversity (ASV)")
+p2 <- plot_alpha(means_asv, "mean_pielou",  "sd_pielou",  "Pielou evenness (ASV)")
+p3 <- plot_alpha(means_phy, "mean_shannon", "sd_shannon", "Shannon diversity (Phylum)")
+p4 <- plot_alpha(means_phy, "mean_pielou",  "sd_pielou",  "Pielou evenness (Phylum)")
+
+# combine into a 2x2 panel
+ggarrange(p1, p2, p3, p4, ncol = 2, nrow = 2,
+          labels = c("A", "B", "C", "D"))
+
+# ggsave("plots/richness_supplement.pdf", width = 15, height = 15, units = "cm")
+```
+
+# sensitivity test of beta measures
+```{r, eval = F}
+# drop BBR to balance the design (only sites present at all layers)
+ps_bal <- subset_samples(ps, code != "BBR")
+
+# loop over layers: PERMANOVA, mean between-site distance, beta-dispersion
+layers <- unique(metadata$layer)
+results_list <- list()
+for (cur_layer in layers) {
+  # subset to current layer and drop empty taxa
+  ps_sub <- subset_samples(ps_bal, layer == cur_layer)
+  ps_sub <- prune_taxa(taxa_sums(ps_sub) > 0, ps_sub)
+  grouping <- sample_data(ps_sub)$code
+
+  # weighted UniFrac distances and group statistics
+  dist_mat <- phyloseq::distance(ps_sub, method = "wunifrac")
+  perm <- vegan::adonis2(dist_mat ~ grouping)
+  md   <- meandist(dist_mat, grouping)
+  disp <- vegan::betadisper(dist_mat, grouping)
+  disp_values <- disp$distances
+
+  # store one row per site pair
+  pair_names <- combn(rownames(md), 2, simplify = FALSE)
+  for (p in pair_names) {
+    pair_label <- paste(sort(p), collapse = " - ")
+    results_list[[paste(cur_layer, pair_label)]] <- data.frame(
+      label         = cur_layer,
+      pair          = pair_label,
+      R2            = perm[1, "R2"],
+      Distance      = md[p[1], p[2]],
+      Dispersion    = mean(disp_values),
+      Dispersion_SE = sd(disp_values) / sqrt(length(disp_values))
+    )
+  }
+}
+
+# reshape to long format and label metrics
+plot_data <- bind_rows(results_list) |>
+  pivot_longer(
+    cols      = c(R2, Distance, Dispersion),
+    names_to  = "metric_raw",
+    values_to = "value"
+  ) |>
+  mutate(
+    SE = case_when(
+      metric_raw == "Dispersion" ~ Dispersion_SE,
+      TRUE ~ 0
+    ),
+    metric_label = factor(case_match(metric_raw,
+      "R2"         ~ "PERMANOVA R²",
+      "Distance"   ~ "Between-Site Distance",
+      "Dispersion" ~ "Beta-Dispersion"
+    )),
+    label = factor(label, levels = c("Ol0", "Ol1", "Olf", "Ohf", "Oh", "A5", "A10"))
+  ) %>%
+  subset(metric_raw != "Distance")
+
+# plot: R2 and dispersion trends across layers
+ggplot(plot_data, aes(x = label, y = value)) +
+  geom_errorbar(
+    aes(ymin = value - SE, ymax = value + SE),
+    width = 0.1, linewidth = 0.3, color = "black",
+    data = subset(plot_data, metric_raw == "Dispersion")
+  ) +
+  geom_line(
+    aes(group = 1),
+    color = "grey60", linewidth = 0.5
+  ) +
+  geom_point(size = 2, color = "black") +
+  facet_wrap(~ metric_label, ncol = 1, scales = "free_y") +
+  labs(x = NULL) +
+  theme_bw(base_size = 8) +
+  theme(
+    axis.text.x      = element_text(angle = 45, hjust = 1, color = "black"),
+    strip.background = element_rect(fill = "white", color = "black"),
+    strip.text       = element_text(size = 7),
+    axis.title.y     = element_blank()
+  )
+
+# ggsave("plots/final_figures/supplement_balanced_beta_per_layer.tiff", width = 7, height = 5, units = "cm", dpi = 400)
+```
